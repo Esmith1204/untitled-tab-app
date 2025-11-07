@@ -1,292 +1,462 @@
-import BigLogo from "../../src/assets/untitled tab app logo.png";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { supabase } from "../lib/supabase";
+import { loadPresetsForUsername, upsertPresetForUsername, deletePresetForUsername } from "../lib/presetsAPI";
+import BigLogo from "../assets/untitled-tab-app-logo.png";
 
 export default function Dashboard() {
-    const [people, setPeople] = useState([]);
-    const [newPerson, setNewPerson] = useState("");
-    const [tip, setTip] = useState("0");
+  // session
+  const [currentUsername, setCurrentUsername] = useState(localStorage.getItem("tabapp_username") || "");
+  const [isSignedIn, setIsSignedIn] = useState(Boolean(localStorage.getItem("tabapp_username")));
 
-    const [presets, setPresets] = useState([]);
-    const [presetName, setPresetName] = useState("");
-    const [selectedPreset, setSelectedPreset] = useState("");
+  // presets
+  const [presets, setPresets] = useState([]);
+  const [selectedPreset, setSelectedPreset] = useState("");
+  const [presetName, setPresetName] = useState("");
 
-    const [lastTipApplied, setLastTipApplied] = useState(0);
+  // dashboard data
+  const [people, setPeople] = useState([]);
+  const [newPerson, setNewPerson] = useState("");
+  const [tip, setTip] = useState("0");
+  const [lastTipApplied, setLastTipApplied] = useState(0);
 
-    const addPerson = () => {
-        const trimmed = newPerson.trim();
-        if (trimmed && !people.find((p) => p.name === trimmed)) {
-            setPeople([...people, { name: trimmed, amount: "0", paid: false }]);
-            setNewPerson("");
-        }
-    };
+  // people ref to avoid stale closures
+  const peopleRef = useRef(people);
+  useEffect(() => { peopleRef.current = people; }, [people]);
 
-    const removePerson = (name) => {
-        setPeople((prev) => prev.filter((p) => p.name !== name));
-    };
+  // load presets when username changes
+  useEffect(() => {
+    if (!currentUsername) {
+      setPresets([]);
+      setSelectedPreset("");
+      return;
+    }
+    let mounted = true;
+    (async () => {
+      try {
+        const rows = await loadPresetsForUsername(currentUsername);
+        if (!mounted) return;
+        setPresets(rows.map(r => ({ id: r.id, name: r.name, data: r.data })));
+      } catch (err) {
+        console.error("loadPresets error", err);
+      }
+    })();
+    return () => (mounted = false);
+  }, [currentUsername]);
 
-    const updateAmount = (index, value) => {
-        setPeople((prev) => {
-            const next = [...prev];
-            next[index] = { ...next[index], amount: value };
-            return next;
-        });
-    };
+  // load preset into UI
+  const loadPresetIntoDashboard = (name) => {
+    setSelectedPreset(name);
+    if (!name) {
+      setPeople([]);
+      setTip("0");
+      setLastTipApplied(0);
+      peopleRef.current = [];
+      return;
+    }
+    const p = presets.find(x => x.name === name);
+    if (!p) return;
 
-    const togglePaid = (index) => {
-        setPeople((prev) => {
-            const next = [...prev];
-            next[index] = { ...next[index], paid: !next[index].paid };
-            return next;
-        });
-    };
+    // ensure data is an object (handle stringified JSON just in case)
+    const rawData = typeof p.data === 'string' ? (() => { try { return JSON.parse(p.data); } catch { return {}; } })() : (p.data || {});
 
-    const numericTip = parseFloat(tip) || 0;
-    const total = people.reduce((sum, p) => sum + (parseFloat(p.amount) || 0), 0);
-    const grandTotal = total + numericTip;
+    const loadedPeople = (rawData.people ?? []).map(pp => ({ id: pp.id || makeId(), ...pp }));
+    setPeople(loadedPeople);
+    peopleRef.current = loadedPeople;
 
-    const startNewPreset = () => {
-        setPeople([]);
+    setTip(rawData.tip ?? "0");
+    setLastTipApplied(0);
+  };
+
+
+  const handleSignIn = async (username) => {
+    const trimmed = username.trim();
+    if (!trimmed) return;
+
+    // Clear local unsaved dashboard state immediately
+    setPeople([]);
+    setNewPerson("");
+    setTip("0");
+    setLastTipApplied(0);
+    peopleRef.current = [];
+
+    // Persist username locally and flip signed-in state
+    localStorage.setItem("tabapp_username", trimmed);
+    setCurrentUsername(trimmed);
+    setIsSignedIn(true);
+
+    // Load remote presets into UI (do NOT autosave local state)
+    try {
+      const rows = await loadPresetsForUsername(trimmed);
+      setPresets(rows.map(r => ({ id: r.id, name: r.name, data: r.data })));
+      setSelectedPreset("");
+      setPresetName("");
+    } catch (err) {
+      console.error("load presets after sign-in failed", err);
+      alert("Failed to load presets after sign-in — check console.");
+    }
+  };
+
+
+  // sign out: do not save anything
+  const handleSignOut = () => {
+    localStorage.removeItem("tabapp_username");
+    setCurrentUsername("");
+    setIsSignedIn(false);
+
+    // clear UI state
+    setPresets([]);
+    setSelectedPreset("");
+    setPresetName("");
+    setPeople([]);
+    setNewPerson("");
+    setTip("0");
+    setLastTipApplied(0);
+
+    // keep ref in sync
+    peopleRef.current = [];
+  };
+
+
+  // manual save via Save preset button
+  const handleManualSave = async () => {
+    const name = (presetName || "").trim();
+    if (!name) { alert("Enter a preset name"); return; }
+    if (!currentUsername) { alert("You must be signed in to save a preset"); return; }
+
+    try {
+      const payload = { people: peopleRef.current, tip };
+      console.log('ABOUT TO UPSERT', { username: currentUsername, name, payload });
+      const created = await upsertPresetForUsername(currentUsername, name, payload);
+      console.log('manual save result', created);
+      const rows = await loadPresetsForUsername(currentUsername);
+      setPresets(rows.map(r => ({ id: r.id, name: r.name, data: r.data })));
+      setSelectedPreset(name);
+      setPresetName("");
+    } catch (err) {
+      console.error('manual save failed', err);
+      alert('Save failed — check console for details.');
+    }
+  };
+
+  // delete preset
+  const handleDeletePreset = async (name) => {
+    if (!currentUsername || !name) return;
+    await deletePresetForUsername(currentUsername, name);
+    setPresets(prev => prev.filter(p => p.name !== name));
+    if (selectedPreset === name) {
+      setSelectedPreset("");
+      setPeople([]);
+      setTip("0");
+      setLastTipApplied(0);
+    }
+  };
+
+  // uses crypto.randomUUID() if available, otherwise fallback to timestamp
+  const makeId = () => (typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID() : String(Date.now());
+
+  const addPerson = async () => {
+    const trimmed = newPerson.trim();
+    if (!trimmed) return;
+
+    const newEntry = { id: makeId(), name: trimmed, amount: "0", paid: false };
+    const nextPeople = [...peopleRef.current, newEntry];
+
+    setPeople(nextPeople);
+    setNewPerson("");
+    peopleRef.current = nextPeople;
+
+    const targetPreset = selectedPreset || (presetName && presetName.trim()) || null;
+    if (!isSignedIn || !currentUsername || !targetPreset) return;
+
+    try {
+      const payload = { people: nextPeople, tip };
+      const created = await upsertPresetForUsername(currentUsername, targetPreset, payload);
+      console.log('Add-person upsert result', created);
+      const rows = await loadPresetsForUsername(currentUsername);
+      setPresets(rows.map(r => ({ id: r.id, name: r.name, data: r.data })));
+      if (!selectedPreset && presetName && presetName.trim()) {
+        setSelectedPreset(targetPreset);
         setPresetName("");
-        setSelectedPreset("");
-        setTip("0");
-        setLastTipApplied(0);
-    };
+      }
+    } catch (err) {
+      console.error('Failed to save preset after adding person', err);
+    }
+  };
 
-    const savePreset = () => {
-        const name = presetName.trim();
-        if (!name) return;
-        const payload = { name, people: people.map((p) => ({ ...p })), tip };
-        setPresets((prev) => {
-            const exists = prev.some((ps) => ps.name === name);
-            if (exists) return prev.map((ps) => (ps.name === name ? payload : ps));
-            return [...prev, payload];
-        });
-        setSelectedPreset(name);
+  const removePerson = async (id) => {
+    const nextPeople = people.filter(p => p.id !== id);
+    setPeople(nextPeople);
+    peopleRef.current = nextPeople;
+    
+    // Pass the updated people array directly to avoid race conditions
+    await savePresetWithData(nextPeople, tip);
+  };
+
+
+  const updateAmount = async (id, value) => {
+    const nextPeople = people.map(p => p.id === id ? { ...p, amount: value } : p);
+    setPeople(nextPeople);
+    peopleRef.current = nextPeople;
+    
+    // Pass the updated people array directly
+    await savePresetWithData(nextPeople, tip);
+  };
+
+  const togglePaid = async (id) => {
+    const nextPeople = people.map(p => p.id === id ? { ...p, paid: !p.paid } : p);
+    setPeople(nextPeople);
+    peopleRef.current = nextPeople;
+    
+    // Pass the updated people array directly to avoid race conditions
+    await savePresetWithData(nextPeople, tip);
+  };
+
+
+  const numericTip = parseFloat(tip) || 0;
+  const total = people.reduce((sum, p) => sum + (parseFloat(p.amount) || 0), 0);
+  const grandTotal = total + numericTip;
+
+  const splitTipEvenly = async () => {
+    const parsedTip = parseFloat(tip) || 0;
+    const delta = parsedTip - lastTipApplied;
+    if (Math.abs(delta) < 1e-12) return;
+    if (people.length === 0) return;
+    const perPerson = delta / people.length;
+    const nextPeople = people.map(p => {
+      const current = parseFloat(p.amount) || 0;
+      return { ...p, amount: String(current + perPerson) };
+    });
+    setPeople(nextPeople);
+    peopleRef.current = nextPeople;
+    setLastTipApplied(parsedTip);
+    
+    // Save with the updated people array
+    await savePresetWithData(nextPeople, tip);
+  };
+
+  const onTipChange = (value) => {
+    if (lastTipApplied !== 0 && people.length > 0) {
+      const undoPerPerson = lastTipApplied / people.length;
+      const nextPeople = people.map(p => {
+        const cur = parseFloat(p.amount) || 0;
+        return { ...p, amount: String(cur - undoPerPerson) };
+      });
+      setPeople(nextPeople);
+      peopleRef.current = nextPeople;
+    }
+    setTip(value);
+    setLastTipApplied(0);
+  };
+
+  // NEW: Helper function that accepts the data directly to avoid race conditions
+  const savePresetWithData = async (peopleData, tipData) => {
+    const presetToSave = selectedPreset || (presetName && presetName.trim()) || null;
+    if (!isSignedIn || !currentUsername || !presetToSave) return;
+
+    try {
+      const payload = { people: peopleData, tip: tipData };
+      const created = await upsertPresetForUsername(currentUsername, presetToSave, payload);
+      console.log('savePresetWithData upsert', created);
+      const rows = await loadPresetsForUsername(currentUsername);
+      setPresets(rows.map(r => ({ id: r.id, name: r.name, data: r.data })));
+      if (!selectedPreset && presetName && presetName.trim()) {
+        setSelectedPreset(presetToSave);
         setPresetName("");
-        setLastTipApplied(0);
-        // clear dashboard after save
-        setPeople([]);
-        setTip("0");
-    };
+      }
+    } catch (err) {
+      console.error('savePresetWithData error', err);
+    }
+  };
 
-    const loadPreset = (name) => {
-        const ps = presets.find((p) => p.name === name);
-        if (!ps) {
-            setSelectedPreset("");
-            setPeople([]);
-            setTip("0");
-            setLastTipApplied(0);
-            return;
-        }
-        setPeople(ps.people.map((p) => ({ name: p.name, amount: String(p.amount), paid: !!p.paid })));
-        setTip(ps.tip ?? "0");
-        setSelectedPreset(name);
-        setLastTipApplied(0);
-    };
+  // save current peopleRef.current + tip to DB if signed in and a preset target exists
+  const savePresetIfNeeded = async (targetName = null) => {
+    const presetToSave = selectedPreset || (targetName ? targetName.trim() : (presetName && presetName.trim())) || null;
+    if (!isSignedIn || !currentUsername || !presetToSave) return;
 
-    const deletePreset = (name) => {
-        if (!name) return;
-        const ok = confirm(`Delete preset "${name}"? This cannot be undone.`);
-        if (!ok) return;
-        setPresets((prev) => prev.filter((p) => p.name !== name));
-        if (selectedPreset === name) {
-            setSelectedPreset("");
-            setPeople([]);
-            setTip("0");
-            setLastTipApplied(0);
-        }
-    };
+    try {
+      const payload = { people: peopleRef.current, tip };
+      const created = await upsertPresetForUsername(currentUsername, presetToSave, payload);
+      console.log('savePresetIfNeeded upsert', created);
+      const rows = await loadPresetsForUsername(currentUsername);
+      setPresets(rows.map(r => ({ id: r.id, name: r.name, data: r.data })));
+      if (!selectedPreset && presetName && presetName.trim()) {
+        setSelectedPreset(presetToSave);
+        setPresetName("");
+      }
+    } catch (err) {
+      console.error('savePresetIfNeeded error', err);
+    }
+  };
 
-    // autosave active preset
-    useEffect(() => {
-        if (!selectedPreset) return;
-        setPresets((prev) =>
-            prev.map((ps) =>
-                ps.name === selectedPreset ? { name: ps.name, people: people.map((p) => ({ ...p })), tip } : ps
-            )
-        );
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [people, tip, selectedPreset]);
 
-    const splitTipEvenly = () => {
-        const parsedTip = parseFloat(tip) || 0;
-        const delta = parsedTip - lastTipApplied;
-        if (Math.abs(delta) < 1e-12) return;
-        if (people.length === 0) return;
-        const perPerson = delta / people.length;
-        setPeople((prev) =>
-            prev.map((p) => {
-                const current = parseFloat(p.amount) || 0;
-                return { ...p, amount: String(current + perPerson) };
-            })
-        );
-        setLastTipApplied(parsedTip);
-    };
-
-    const onTipChange = (value) => {
-        if (lastTipApplied !== 0 && people.length > 0) {
-            const undoPerPerson = lastTipApplied / people.length;
-            setPeople((prev) =>
-                prev.map((p) => {
-                    const cur = parseFloat(p.amount) || 0;
-                    return { ...p, amount: String(cur - undoPerPerson) };
-                })
-            );
-        }
-        setTip(value);
-        setLastTipApplied(0);
-    };
-
-    return (
-        <div className="hero bg-base-200 min-h-screen p-6">
-            <div className="hero-content flex flex-col gap-6 w-full max-w-2xl">
-
-                {/* NAVBAR PLACEHOLDER */}
-                <div className="w-full mb-2">
-                    {/* If you have an actual navbar component, render it here.
-              The logo will appear right under it. */}
-                </div>
-
-                {/* Inline logo placed between navbar and Presets */}
-                <div className="flex justify-center mb-4">
-                    <img src={BigLogo} alt="App logo" className="h-20 w-auto select-none drop-shadow-md" />
-                </div>
-
-                {/* Presets */}
-                <fieldset className="fieldset w-full">
-                    <legend className="fieldset-legend">Presets</legend>
-
-                    {/* top row: select left, Clear and New buttons to the right */}
-                    <div className="flex items-center gap-3">
-                        <div className="flex-1">
-                            <select
-                                className="select select-bordered w-full"
-                                value={selectedPreset}
-                                onChange={(e) => loadPreset(e.target.value)}
-                            >
-                                <option value="">Choose a preset to load</option>
-                                {presets.map((ps, idx) => (
-                                    <option key={idx} value={ps.name}>
-                                        {ps.name}
-                                    </option>
-                                ))}
-                            </select>
-                        </div>
-
-                        <div className="flex gap-2">
-                            <button className="btn btn-sm" onClick={() => loadPreset("")}>
-                                Clear
-                            </button>
-                            <button className="btn btn-sm" onClick={startNewPreset}>
-                                New preset
-                            </button>
-                        </div>
-                    </div>
-
-                    {/* second row: preset name input + Save or Active + Delete */}
-                    <div className="flex items-center gap-3 mt-3">
-                        {!selectedPreset ? (
-                            <>
-                                <input
-                                    type="text"
-                                    className="input input-bordered w-full"
-                                    placeholder="Preset name (save current people + tip)"
-                                    value={presetName}
-                                    onChange={(e) => setPresetName(e.target.value)}
-                                />
-
-                                <div className="flex gap-2">
-                                    <button className="btn btn-primary" onClick={savePreset}>
-                                        Save preset
-                                    </button>
-                                    <div className="w-28" />
-                                </div>
-                            </>
-                        ) : (
-                            <>
-                                <div className="flex-1">
-                                    <span className="font-medium">Active: {selectedPreset}</span>
-                                </div>
-
-                                <div className="flex gap-2">
-                                    <button className="btn btn-error" onClick={() => deletePreset(selectedPreset)}>
-                                        Delete preset
-                                    </button>
-                                    <div className="w-28" />
-                                </div>
-                            </>
-                        )}
-                    </div>
-                </fieldset>
-
-                {/* Add Person */}
-                <fieldset className="fieldset w-full">
-                    <legend className="fieldset-legend">Add a person</legend>
-                    <div className="flex gap-2">
-                        <input type="text" className="input input-bordered w-full" placeholder="Type name" value={newPerson} onChange={(e) => setNewPerson(e.target.value)} />
-                        <button className="btn btn-primary" onClick={addPerson}>
-                            Add
-                        </button>
-                    </div>
-                </fieldset>
-
-                {/* Payments */}
-                <fieldset className="fieldset w-full">
-                    <legend className="fieldset-legend">Payments</legend>
-                    <div className="flex flex-col gap-4">
-                        {people.length === 0 && <div className="text-sm text-muted-foreground">No people yet. Add a person to start splitting.</div>}
-
-                        {people.map((p, i) => (
-                            <div key={i} className="flex justify-between items-center gap-2">
-                                <div className="flex items-center gap-3">
-                                    <button className={`btn btn-ghost btn-sm btn-outline ${p.paid ? "bg-green-200 text-black" : ""}`} onClick={() => togglePaid(i)} title={p.paid ? "Mark as unpaid" : "Mark as paid"}>
-                                        {p.paid ? "Paid" : "Mark"}
-                                    </button>
-
-                                    <span className={`font-bold ${p.paid ? "opacity-60 line-through" : ""}`}>{p.name}</span>
-                                </div>
-
-                                <input type="text" inputMode="decimal" pattern="[0-9]*" className="input input-sm w-24" value={p.amount} onChange={(e) => updateAmount(i, e.target.value)} disabled={p.paid} />
-
-                                <button className="btn btn-sm btn-error" onClick={() => removePerson(p.name)}>
-                                    Remove
-                                </button>
-                            </div>
-                        ))}
-                    </div>
-                </fieldset>
-
-                {/* Summary */}
-                <fieldset className="fieldset w-full">
-                    <legend className="fieldset-legend">Summary</legend>
-                    <div className="flex flex-col gap-2">
-                        <div className="flex justify-between">
-                            <span>Total:</span>
-                            <span>${total.toFixed(2)}</span>
-                        </div>
-
-                        {/* Tip row — input keeps its size, split button aligned to the right */}
-                        <div className="flex items-center gap-2">
-                            <span>Tip:</span>
-
-                            <div className="w-24">
-                                <input type="text" className="input input-sm w-full text-right" inputMode="decimal" value={tip} onChange={(e) => onTipChange(e.target.value)} />
-                            </div>
-
-                            <div className="ml-auto">
-                                <button className="btn btn-sm" onClick={splitTipEvenly}>
-                                    Split tip evenly
-                                </button>
-                            </div>
-                        </div>
-
-                        <div className="flex justify-between font-bold">
-                            <span>Grand Total:</span>
-                            <span>${grandTotal.toFixed(2)}</span>
-                        </div>
-                    </div>
-                </fieldset>
-            </div>
+  return (
+    <div className="hero bg-base-200 min-h-screen p-6">
+      <div className="hero-content flex flex-col gap-6 w-full max-w-3xl">
+        {/* Logo at the top center */}
+        <div className="flex justify-center w-full mb-4">
+          <img src={BigLogo} alt="logo" className="h-20 w-auto select-none" />
         </div>
-    );
+
+        {/* Sign in section */}
+        <div className="card bg-base-100 shadow-xl w-full">
+          <div className="card-body">
+            <h2 className="card-title">Account</h2>
+            <div className="flex items-center gap-3">
+              <input
+                className="input input-bordered flex-1"
+                placeholder="Enter username"
+                value={currentUsername}
+                onChange={(e) => setCurrentUsername(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter") handleSignIn(currentUsername); }}
+              />
+              <button className="btn btn-primary" onClick={() => handleSignIn(currentUsername)}>
+                {isSignedIn ? "Switch User" : "Sign In"}
+              </button>
+              {isSignedIn && (
+                <button className="btn btn-ghost" onClick={handleSignOut}>Sign Out</button>
+              )}
+            </div>
+            <div className="text-sm text-base-content/60 mt-2">
+              Status: <span className="font-semibold">{isSignedIn ? `Signed in as ${currentUsername}` : "Not signed in"}</span>
+            </div>
+          </div>
+        </div>
+
+        <fieldset className="fieldset w-full">
+          <legend className="fieldset-legend">Presets</legend>
+          <div className="space-y-3">
+            <div className="flex items-center gap-3">
+              <select className="select select-bordered flex-1" value={selectedPreset} onChange={(e) => loadPresetIntoDashboard(e.target.value)}>
+                <option value="">Choose a preset to load</option>
+                {presets.map((ps) => <option key={ps.name} value={ps.name}>{ps.name}</option>)}
+              </select>
+              <button className="btn btn-outline" onClick={() => { setSelectedPreset(""); setPeople([]); setTip("0"); setPresetName(""); }}>Clear</button>
+              <button className="btn btn-outline" onClick={() => { setPeople([]); setTip("0"); setSelectedPreset(""); setPresetName(""); }}>New Preset</button>
+            </div>
+
+            <div className="divider my-2"></div>
+
+            <div className="flex items-center gap-3">
+              <input 
+                type="text" 
+                className="input input-bordered flex-1" 
+                placeholder="Enter preset name to save" 
+                value={presetName} 
+                onChange={(e) => setPresetName(e.target.value)} 
+                onKeyDown={(e) => { if (e.key === "Enter") handleManualSave(); }} 
+              />
+              <button className="btn btn-primary" onClick={handleManualSave}>Save Preset</button>
+              {selectedPreset && <button className="btn btn-error" onClick={() => handleDeletePreset(selectedPreset)}>Delete</button>}
+            </div>
+          </div>
+        </fieldset>
+
+        <fieldset className="fieldset w-full">
+          <legend className="fieldset-legend">Add Person</legend>
+          <div className="flex gap-3">
+            <input 
+              type="text" 
+              className="input input-bordered flex-1" 
+              placeholder="Enter person's name" 
+              value={newPerson} 
+              onChange={(e) => setNewPerson(e.target.value)} 
+              onKeyDown={(e) => { if (e.key === "Enter") addPerson(); }} 
+            />
+            <button className="btn btn-primary" onClick={addPerson}>Add Person</button>
+          </div>
+        </fieldset>
+
+        <fieldset className="fieldset w-full">
+          <legend className="fieldset-legend">People & Payments</legend>
+          <div className="flex flex-col gap-3">
+            {people.length === 0 && (
+              <div className="text-center py-8 text-base-content/60">
+                No people added yet. Add a person above to start splitting bills.
+              </div>
+            )}
+            {people.map((p) => (
+              <div key={p.id} className="card bg-base-100 shadow-sm">
+                <div className="card-body p-4">
+                  <div className="flex items-center justify-between gap-4">
+                    <div className="flex items-center gap-3 flex-1">
+                      <button
+                        className={`btn btn-sm ${p.paid ? "btn-success" : "btn-outline btn-ghost"}`}
+                        onClick={() => togglePaid(p.id)}
+                        title={p.paid ? "Mark as unpaid" : "Mark as paid"}
+                      >
+                        {p.paid ? "✓ Paid" : "Mark Paid"}
+                      </button>
+                      <span className={`text-lg font-semibold ${p.paid ? "opacity-50 line-through" : ""}`}>
+                        {p.name}
+                      </span>
+                    </div>
+
+                    <div className="flex items-center gap-3">
+                      <div className="flex items-center gap-2">
+                        <span className="text-sm font-medium">$</span>
+                        <input
+                          type="text"
+                          inputMode="decimal"
+                          pattern="[0-9]*"
+                          className="input input-bordered input-sm w-24 text-right"
+                          value={p.amount}
+                          onChange={(e) => updateAmount(p.id, e.target.value)}
+                          disabled={p.paid}
+                        />
+                      </div>
+                      <button className="btn btn-sm btn-error btn-outline" onClick={() => removePerson(p.id)}>
+                        Remove
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </fieldset>
+
+        <fieldset className="fieldset w-full">
+          <legend className="fieldset-legend">Summary</legend>
+          <div className="card bg-base-100 shadow-sm">
+            <div className="card-body">
+              <div className="space-y-4">
+                <div className="flex justify-between items-center text-lg">
+                  <span className="font-medium">Subtotal:</span>
+                  <span className="font-semibold">${total.toFixed(2)}</span>
+                </div>
+                
+                <div className="divider my-2"></div>
+                
+                <div className="flex items-center justify-between gap-4">
+                  <span className="font-medium text-lg">Tip:</span>
+                  <div className="flex items-center gap-3">
+                    <div className="flex items-center gap-2">
+                      <span className="text-sm font-medium">$</span>
+                      <input 
+                        type="text" 
+                        className="input input-bordered w-28 text-right" 
+                        inputMode="decimal" 
+                        value={tip} 
+                        onChange={(e) => onTipChange(e.target.value)} 
+                      />
+                    </div>
+                    <button className="btn btn-outline btn-sm" onClick={splitTipEvenly}>
+                      Split Evenly
+                    </button>
+                  </div>
+                </div>
+                
+                <div className="divider my-2"></div>
+                
+                <div className="flex justify-between items-center text-2xl">
+                  <span className="font-bold">Grand Total:</span>
+                  <span className="font-bold text-primary">${grandTotal.toFixed(2)}</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </fieldset>
+      </div>
+    </div>
+  );
 }

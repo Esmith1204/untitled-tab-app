@@ -1,4 +1,4 @@
-import Logo from "../../src/assets/untitled app small logo.png"
+import Logo from "../../src/assets/untitled-app-small-logo.png"
 
 export default function Footer() {
     return (
